@@ -567,6 +567,7 @@ select.field-input { appearance:none; cursor:pointer; }
 .gp-bar { height:100%; background:linear-gradient(90deg,var(--red),var(--gold)); border-radius:100px; transition:width 0.5s ease; width:0%; }
 .gp-pct { font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--muted); margin-top:8px; }
 </style>
+<script src="https://unpkg.com/webm-muxer/build/webm-muxer.js" defer></script>
 </head>
 <body>
 
@@ -1310,21 +1311,74 @@ function sanitizeFilename(name) {
 // ============================================================
 // CREATE SINGLE VIDEO BLOB
 // ============================================================
+async function legacyCreateVideoBlob(trackList, title, jobIndex, W, H, layout, channel, genre, outBuf, duration, trackMarkers) {
+  const canvas=document.createElement('canvas');
+  canvas.width=W; canvas.height=H;
+  const ctx2d=canvas.getContext('2d');
+
+  const stream=canvas.captureStream(30);
+
+  const recCtx=new AudioContext();
+  const src=recCtx.createBufferSource();
+  src.buffer=outBuf;
+  const dest=recCtx.createMediaStreamDestination();
+  src.connect(dest);
+  stream.addTrack(dest.stream.getAudioTracks()[0]);
+
+  const mimes=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+  const mime=mimes.find(m=>MediaRecorder.isTypeSupported(m))||'video/webm';
+  const recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:4000000});
+  const chunks=[];
+  recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
+
+  recorder.start(200);
+  src.start();
+
+  const FPS=30;
+  const totalFrames=Math.ceil(duration*FPS);
+
+  await new Promise((resolve)=>{
+    let frame=0;
+    let frameProgress=0;
+    function renderFrame() {
+      if(frame>=totalFrames){ recorder.stop(); src.stop(); return; }
+      frameProgress=frame/totalFrames;
+      const elapsed=frameProgress*duration;
+      let curTrackIdx=0;
+      for(let i=trackMarkers.length-1;i>=0;i--){
+        if(elapsed>=trackMarkers[i].start){ curTrackIdx=i; break; }
+      }
+      const curTrackName=trackMarkers[curTrackIdx]?.name||title;
+      drawVideoFrame(ctx2d,W,H,layout,channel,curTrackName,title,genre,frame,frameProgress,elapsed,duration,trackMarkers);
+      frame++;
+      const pct=(jobIndex/Math.max(tracks.length,1))*100 + frameProgress*(85/Math.max(tracks.length,1));
+      if(frame%15===0) setProgress(Math.min(95,pct),`สร้างวิดีโอ (ช้า): ${Math.round(frameProgress*100)}%`,curTrackName);
+      setTimeout(renderFrame, 1000/FPS);
+    }
+    renderFrame();
+    recorder.onstop=resolve;
+  });
+
+  await recCtx.close();
+  return new Blob(chunks,{type:mime});
+}
+
 async function createVideoBlob(trackList, title, jobIndex) {
   const res=document.getElementById('resolution').value.split('x');
   const W=parseInt(res[0]), H=parseInt(res[1]);
   const layout=document.getElementById('layout').value;
   const channel='AI MusicBox P';
-  const genre=document.getElementById('genre').value;
+  const genre=document.getElementById('genre') ? document.getElementById('genre').value : '';
 
   // 1) Decode & concatenate audio
+  // Force 48000 Hz for Opus compatibility in WebM Muxer
   const AudioContext=window.AudioContext||window.webkitAudioContext;
-  const audioCtx=new AudioContext();
+  const audioCtx=new AudioContext({ sampleRate: 48000 });
   const buffers=[];
 
   for(let i=0;i<trackList.length;i++){
     setProgress(
-      (jobIndex/Math.max(tracks.length,1))*100 + (i/trackList.length)*(85/Math.max(tracks.length,1)),
+      (jobIndex/Math.max(tracks.length,1))*100 + (i/trackList.length)*(20/Math.max(tracks.length,1)),
       `กำลังถอดรหัสเสียง...`,
       trackList[i].name
     );
@@ -1349,76 +1403,119 @@ async function createVideoBlob(trackList, title, jobIndex) {
   }
   const duration=outBuf.duration;
 
-  // 2) Setup canvas + MediaRecorder
-  const canvas=document.createElement('canvas');
-  canvas.width=W; canvas.height=H;
-  const ctx2d=canvas.getContext('2d');
-
-  const stream=canvas.captureStream(30);
-
-  const recCtx=new AudioContext();
-  const src=recCtx.createBufferSource();
-  src.buffer=outBuf;
-  const dest=recCtx.createMediaStreamDestination();
-  src.connect(dest);
-  stream.addTrack(dest.stream.getAudioTracks()[0]);
-
-  const mimes=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
-  const mime=mimes.find(m=>MediaRecorder.isTypeSupported(m))||'video/webm';
-  const recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:4000000});
-  const chunks=[];
-  recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
-
-  // Build tracklist for display
   let cumTime=0;
   const trackMarkers=trackList.map(t=>{
     const s=cumTime; cumTime+=t.duration;
     return {name:t.name,start:s};
   });
 
-  // 3) Render frames
-  recorder.start(200);
-  src.start();
+  // Check support for WebCodecs and WebMMuxer
+  if (!window.VideoEncoder || !window.AudioEncoder || !window.WebMMuxer) {
+    console.warn("WebCodecs API not supported, using fallback.");
+    const blob = await legacyCreateVideoBlob(trackList, title, jobIndex, W, H, layout, channel, genre, outBuf, duration, trackMarkers);
+    await audioCtx.close();
+    return blob;
+  }
 
-  const startT=performance.now();
+  // 2) Fast Offline Rendering using WebCodecs
   const FPS=30;
   const totalFrames=Math.ceil(duration*FPS);
 
-  await new Promise((resolve)=>{
-    let frame=0;
-    let frameProgress=0;
+  const canvas=document.createElement('canvas');
+  canvas.width=W; canvas.height=H;
+  const ctx2d=canvas.getContext('2d');
 
-    function renderFrame() {
-      if(frame>=totalFrames){ recorder.stop(); src.stop(); return; }
-      frameProgress=frame/totalFrames;
-      const elapsed=frameProgress*duration;
+  let muxer;
+  try {
+    muxer = new WebMMuxer.Muxer({
+      target: new WebMMuxer.ArrayBufferTarget(),
+      video: { codec: 'V_VP8', width: W, height: H, frameRate: FPS },
+      audio: { codec: 'A_OPUS', sampleRate: sr, numberOfChannels: nch }
+    });
+  } catch(e) {
+    console.warn("WebMMuxer init failed:", e);
+    const blob = await legacyCreateVideoBlob(trackList, title, jobIndex, W, H, layout, channel, genre, outBuf, duration, trackMarkers);
+    await audioCtx.close();
+    return blob;
+  }
 
-      // Find current track
-      let curTrackIdx=0;
-      for(let i=trackMarkers.length-1;i>=0;i--){
-        if(elapsed>=trackMarkers[i].start){ curTrackIdx=i; break; }
-      }
-      const curTrackName=trackMarkers[curTrackIdx]?.name||title;
-
-      drawVideoFrame(ctx2d,W,H,layout,channel,curTrackName,title,genre,frame,frameProgress,elapsed,duration,trackMarkers);
-      frame++;
-
-      const pct=(jobIndex/Math.max(tracks.length,1))*100 + frameProgress*(85/Math.max(tracks.length,1));
-      if(frame%15===0){
-        setProgress(Math.min(95,pct),`สร้างวิดีโอ: ${Math.round(frameProgress*100)}%`,curTrackName);
-      }
-
-      setTimeout(renderFrame, 1000/FPS);
-    }
-
-    renderFrame();
-    recorder.onstop=resolve;
+  const videoEncoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: e => console.error(e)
+  });
+  videoEncoder.configure({
+    codec: 'vp8', width: W, height: H, bitrate: 4_000_000, framerate: FPS
   });
 
-  await audioCtx.close();
-  await recCtx.close();
+  const audioEncoder = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: e => console.error(e)
+  });
+  audioEncoder.configure({
+    codec: 'opus', sampleRate: sr, numberOfChannels: nch, bitrate: 128_000
+  });
 
-  return new Blob(chunks,{type:mime});
+  // Encode Audio (Chunks of 1s max)
+  const framesPerChunk = sr;
+  for(let offset=0; offset<totalSamples; offset+=framesPerChunk) {
+    const chunkFrames = Math.min(framesPerChunk, totalSamples - offset);
+    const audioDataPlanar = new Float32Array(chunkFrames * nch);
+    for(let c=0; c<nch; c++) {
+      const channelData = outBuf.getChannelData(c).subarray(offset, offset + chunkFrames);
+      audioDataPlanar.set(channelData, c * chunkFrames);
+    }
+    const audioData = new AudioData({
+      format: 'f32-planar',
+      sampleRate: sr, numberOfFrames: chunkFrames, numberOfChannels: nch,
+      timestamp: (offset / sr) * 1_000_000,
+      data: audioDataPlanar
+    });
+    audioEncoder.encode(audioData);
+    audioData.close();
+  }
+
+  // Encode Video
+  let frame = 0;
+  while(frame < totalFrames) {
+    // Await if VideoEncoder is buffering too many frames to ease RAM usage
+    if(videoEncoder.encodeQueueSize > 60) {
+      await new Promise(r => setTimeout(r, 10));
+      continue;
+    }
+
+    const frameProgress = frame / totalFrames;
+    const elapsed = frameProgress * duration;
+
+    let curTrackIdx=0;
+    for(let i=trackMarkers.length-1; i>=0; i--){
+      if(elapsed>=trackMarkers[i].start){ curTrackIdx=i; break; }
+    }
+    const curTrackName=trackMarkers[curTrackIdx]?.name||title;
+
+    drawVideoFrame(ctx2d,W,H,layout,channel,curTrackName,title,genre,frame,frameProgress,elapsed,duration,trackMarkers);
+
+    const videoFrame = new VideoFrame(canvas, { timestamp: (frame / FPS) * 1_000_000 });
+    videoEncoder.encode(videoFrame, { keyFrame: frame % 150 === 0 });
+    videoFrame.close();
+
+    frame++;
+
+    if (frame % 30 === 0) {
+      const basePct = (jobIndex/Math.max(tracks.length,1))*100;
+      const pct = basePct + 20 + frameProgress*(75/Math.max(tracks.length,1));
+      setProgress(Math.min(98, pct), `กำลังเรนเดอร์ภาพ... ${Math.round(frameProgress*100)}%`, curTrackName);
+      await new Promise(r => setTimeout(r, 0)); // Yield to UI so it doesn't freeze
+    }
+  }
+
+  setProgress(99, `กำลังบันทึกไฟล์...`, title);
+  
+  await audioEncoder.flush();
+  await videoEncoder.flush();
+  muxer.finalize();
+  await audioCtx.close();
+  
+  return new Blob([muxer.target.buffer], { type: 'video/webm' });
 }
 
 // ============================================================
