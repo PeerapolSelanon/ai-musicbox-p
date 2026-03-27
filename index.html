@@ -567,7 +567,7 @@ select.field-input { appearance:none; cursor:pointer; }
 .gp-bar { height:100%; background:linear-gradient(90deg,var(--red),var(--gold)); border-radius:100px; transition:width 0.5s ease; width:0%; }
 .gp-pct { font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--muted); margin-top:8px; }
 </style>
-<script src="https://unpkg.com/webm-muxer/build/webm-muxer.js" defer></script>
+<script src="https://unpkg.com/mp4-muxer/build/mp4-muxer.js" defer></script>
 </head>
 <body>
 
@@ -576,7 +576,10 @@ select.field-input { appearance:none; cursor:pointer; }
   <div class="brand">
     <div class="yt-icon">▶</div>
     <div class="brand-text">
-      <div class="brand-name">AI MusicBox P</div>
+      <div class="brand-name" style="display:flex; align-items:center;">
+        AI MusicBox P 
+        <span style="font-size:10px; color:var(--gold); margin-left:8px; background:rgba(255,215,0,0.15); border:1px solid rgba(255,215,0,0.3); padding:2px 6px; border-radius:6px; letter-spacing:0.5px;">v2.0</span>
+      </div>
       <div class="brand-sub">YouTube Video Creator</div>
     </div>
   </div>
@@ -725,7 +728,7 @@ select.field-input { appearance:none; cursor:pointer; }
       <ul class="yt-info-list">
         <li>Title = ชื่อเพลง / playlist ที่ตั้งไว้ด้านล่าง</li>
         <li>Description จะถูกสร้างอัตโนมัติพร้อม tracklist</li>
-        <li>ไฟล์วิดีโอ .webm เปิดได้บน YouTube ได้เลย</li>
+        <li>ไฟล์วิดีโอ .mp4 คุณภาพสูง เปิดบน YouTube ได้เลย</li>
       </ul>
     </div>
 
@@ -818,7 +821,7 @@ select.field-input { appearance:none; cursor:pointer; }
       <div class="yt-info-title">📤 วิธีอัพโหลดขึ้น YouTube</div>
       <ul class="yt-info-list">
         <li>เปิด <b>YouTube Studio</b> → Create → Upload Videos</li>
-        <li>ลากไฟล์ .webm ที่ดาวน์โหลด หรือกด Select Files</li>
+        <li>ลากไฟล์ .mp4 ที่ดาวน์โหลด หรือกด Select Files</li>
         <li>ใส่ Title, Description, Tags ตามที่ copy ไว้</li>
         <li>เลือก Audience → Not made for kids (ถ้าไม่ใช่เนื้อหาเด็ก)</li>
         <li>กด Publish — YouTube จะ process ไฟล์อีกครั้ง</li>
@@ -1272,7 +1275,7 @@ async function startCreate() {
       for(let i=0;i<tracks.length;i++){
         setProgress((i/tracks.length)*100, `สร้างวิดีโอ ${i+1}/${tracks.length}`, tracks[i].name);
         const blob=await createVideoBlob([tracks[i]], tracks[i].name, i);
-        outputBlobs.push({blob, name:sanitizeFilename(tracks[i].name)+'.webm', title:tracks[i].name});
+        outputBlobs.push({blob, name:sanitizeFilename(tracks[i].name)+'.mp4', title:tracks[i].name});
         setProgress(((i+1)/tracks.length)*100);
         await sleep(100);
       }
@@ -1280,7 +1283,7 @@ async function startCreate() {
       const title=document.getElementById('video-title').value || 'playlist';
       setProgress(10,'กำลังรวมเสียง…','');
       const blob=await createVideoBlob(tracks, title, 0);
-      outputBlobs.push({blob, name:sanitizeFilename(title)+'.webm', title});
+      outputBlobs.push({blob, name:sanitizeFilename(title)+'.mp4', title});
     }
 
     setProgress(100,'เสร็จสิ้น! 🎉','');
@@ -1409,16 +1412,16 @@ async function createVideoBlob(trackList, title, jobIndex) {
     return {name:t.name,start:s};
   });
 
-  // Check support for WebCodecs and WebMMuxer
-  if (!window.VideoEncoder || !window.AudioEncoder || !window.WebMMuxer) {
+  // Check support for WebCodecs and Mp4Muxer
+  if (!window.VideoEncoder || !window.AudioEncoder || !window.Mp4Muxer) {
     console.warn("WebCodecs API not supported, using fallback.");
     const blob = await legacyCreateVideoBlob(trackList, title, jobIndex, W, H, layout, channel, genre, outBuf, duration, trackMarkers);
     await audioCtx.close();
     return blob;
   }
 
-  // 2) Fast Offline Rendering using WebCodecs
-  const FPS=30;
+  // 2) Fast Offline Rendering using WebCodecs + Hardware acceleration
+  const FPS=20; // Lowered to 20 for faster rendering without losing aesthetic
   const totalFrames=Math.ceil(duration*FPS);
 
   const canvas=document.createElement('canvas');
@@ -1427,13 +1430,14 @@ async function createVideoBlob(trackList, title, jobIndex) {
 
   let muxer;
   try {
-    muxer = new WebMMuxer.Muxer({
-      target: new WebMMuxer.ArrayBufferTarget(),
-      video: { codec: 'V_VP8', width: W, height: H, frameRate: FPS },
-      audio: { codec: 'A_OPUS', sampleRate: sr, numberOfChannels: nch }
+    muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: { codec: 'avc', width: W, height: H, frameRate: FPS },
+      audio: { codec: 'aac', sampleRate: sr, numberOfChannels: nch },
+      fastStart: 'in-memory'
     });
   } catch(e) {
-    console.warn("WebMMuxer init failed:", e);
+    console.warn("Mp4Muxer init failed:", e);
     const blob = await legacyCreateVideoBlob(trackList, title, jobIndex, W, H, layout, channel, genre, outBuf, duration, trackMarkers);
     await audioCtx.close();
     return blob;
@@ -1441,18 +1445,19 @@ async function createVideoBlob(trackList, title, jobIndex) {
 
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: e => console.error(e)
+    error: e => console.error('VideoEncoder error:', e)
   });
   videoEncoder.configure({
-    codec: 'vp8', width: W, height: H, bitrate: 4_000_000, framerate: FPS
+    codec: 'avc1.42E01E', width: W, height: H, bitrate: 4_000_000, framerate: FPS,
+    hardwareAcceleration: 'prefer-hardware' // MASSIVE SPEEDUP!
   });
 
   const audioEncoder = new AudioEncoder({
     output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-    error: e => console.error(e)
+    error: e => console.error('AudioEncoder error:', e)
   });
   audioEncoder.configure({
-    codec: 'opus', sampleRate: sr, numberOfChannels: nch, bitrate: 128_000
+    codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: nch, bitrate: 128_000
   });
 
   // Encode Audio (Chunks of 1s max)
@@ -1495,27 +1500,27 @@ async function createVideoBlob(trackList, title, jobIndex) {
     drawVideoFrame(ctx2d,W,H,layout,channel,curTrackName,title,genre,frame,frameProgress,elapsed,duration,trackMarkers);
 
     const videoFrame = new VideoFrame(canvas, { timestamp: (frame / FPS) * 1_000_000 });
-    videoEncoder.encode(videoFrame, { keyFrame: frame % 150 === 0 });
+    videoEncoder.encode(videoFrame, { keyFrame: frame % 100 === 0 });
     videoFrame.close();
 
     frame++;
 
-    if (frame % 30 === 0) {
+    if (frame % 20 === 0) {
       const basePct = (jobIndex/Math.max(tracks.length,1))*100;
       const pct = basePct + 20 + frameProgress*(75/Math.max(tracks.length,1));
-      setProgress(Math.min(98, pct), `กำลังเรนเดอร์ภาพ... ${Math.round(frameProgress*100)}%`, curTrackName);
+      setProgress(Math.min(98, pct), `กำลังเรนเดอร์ภาพ (H.264 HW Acceleration)... ${Math.round(frameProgress*100)}%`, curTrackName);
       await new Promise(r => setTimeout(r, 0)); // Yield to UI so it doesn't freeze
     }
   }
 
-  setProgress(99, `กำลังบันทึกไฟล์...`, title);
+  setProgress(99, `กำลังบันทึกไฟล์ MP4...`, title);
   
   await audioEncoder.flush();
   await videoEncoder.flush();
   muxer.finalize();
   await audioCtx.close();
   
-  return new Blob([muxer.target.buffer], { type: 'video/webm' });
+  return new Blob([muxer.target.buffer], { type: 'video/mp4' });
 }
 
 // ============================================================
